@@ -1,0 +1,549 @@
+const mongoose = require("mongoose");
+const User = require("../models/User");
+const Order = require("../models/Order");
+const Address = require("../models/Address");
+
+// What counts as a real purchase: paid for, and not cancelled.
+const PURCHASE_MATCH = {
+  paymentStatus: "captured",
+  orderStatus: { $ne: "cancelled" },
+};
+
+// ======================================================
+// UPDATE USER ROLE
+// ======================================================
+
+const updateUserRole = async (
+  req,
+  res,
+  next
+) => {
+  try {
+    const { userId } = req.params;
+    const { role } = req.body;
+
+    // Validate user ID
+    if (
+      !mongoose.Types.ObjectId.isValid(userId)
+    ) {
+      return res.status(400).json({
+        success: false,
+        message: "Invalid user ID",
+      });
+    }
+
+    // Validate role
+    if (
+      !["customer", "admin"].includes(role)
+    ) {
+      return res.status(400).json({
+        success: false,
+        message:
+          "Role must be customer or admin",
+      });
+    }
+
+    // Find user
+    const user =
+      await User.findById(userId);
+
+    if (!user) {
+      return res.status(404).json({
+        success: false,
+        message: "User not found",
+      });
+    }
+
+    // Don't allow admin to change their own role
+    if (
+      user._id.toString() ===
+      req.user.userId
+    ) {
+      return res.status(400).json({
+        success: false,
+        message:
+          "You cannot change your own role",
+      });
+    }
+
+    user.role = role;
+
+    await user.save();
+
+    return res.status(200).json({
+      success: true,
+      message:
+        "User role updated successfully",
+      data: {
+        user: {
+          id: user._id,
+          name: user.name,
+          email: user.email,
+          phone: user.phone,
+          role: user.role,
+          isVerified:
+            user.isVerified,
+          isActive:
+            user.isActive,
+        },
+      },
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
+
+
+// ======================================================
+// GET ALL USERS - ADMIN
+// Search + Role + Status + Sort + Pagination
+// ======================================================
+
+const getAdminUsers = async (
+  req,
+  res,
+  next
+) => {
+  try {
+    const {
+      search = "",
+      role = "all",
+      status = "all",
+      sort = "newest",
+      buyers = "all",
+      page = 1,
+      limit = 20,
+    } = req.query;
+
+    // --------------------------------------------------
+    // PAGINATION
+    // --------------------------------------------------
+
+    const currentPage = Math.max(
+      Number(page) || 1,
+      1
+    );
+
+    const perPage = Math.min(
+      Math.max(Number(limit) || 20, 1),
+      100
+    );
+
+    const skip =
+      (currentPage - 1) * perPage;
+
+    // --------------------------------------------------
+    // FILTER
+    // --------------------------------------------------
+
+    const filter = {};
+
+    // Role
+    if (role !== "all") {
+      if (
+        !["customer", "admin"].includes(
+          role
+        )
+      ) {
+        return res.status(400).json({
+          success: false,
+          message:
+            "Invalid role",
+        });
+      }
+
+      filter.role = role;
+    }
+
+    // Status
+    if (status === "active") {
+      filter.isActive = true;
+    }
+
+    if (status === "inactive") {
+      filter.isActive = false;
+    }
+
+    // Search
+    if (search.trim()) {
+      filter.$or = [
+        {
+          name: {
+            $regex: search.trim(),
+            $options: "i",
+          },
+        },
+        {
+          email: {
+            $regex: search.trim(),
+            $options: "i",
+          },
+        },
+        {
+          phone: {
+            $regex: search.trim(),
+            $options: "i",
+          },
+        },
+      ];
+    }
+
+    // Purchased / never purchased
+    if (buyers !== "all") {
+      if (
+        !["purchased", "not_purchased"].includes(
+          buyers
+        )
+      ) {
+        return res.status(400).json({
+          success: false,
+          message: "Invalid buyers filter",
+        });
+      }
+
+      const buyerIds = await Order.distinct(
+        "user",
+        PURCHASE_MATCH
+      );
+
+      filter._id =
+        buyers === "purchased"
+          ? { $in: buyerIds }
+          : { $nin: buyerIds };
+    }
+
+    // --------------------------------------------------
+    // SORT
+    // --------------------------------------------------
+
+    const sortOption =
+      sort === "oldest"
+        ? { createdAt: 1 }
+        : { createdAt: -1 };
+
+    // --------------------------------------------------
+    // GET USERS
+    // --------------------------------------------------
+
+    const [
+      users,
+      totalUsers,
+    ] = await Promise.all([
+      User.find(filter)
+        .select(
+          "-password -resetPasswordTokenHash -resetPasswordExpiresAt -emailVerificationTokenHash -emailVerificationExpiresAt"
+        )
+        .sort(sortOption)
+        .skip(skip)
+        .limit(perPage)
+        .lean(),
+
+      User.countDocuments(filter),
+    ]);
+
+    // --------------------------------------------------
+    // PURCHASE SUMMARY for the users on this page
+    // --------------------------------------------------
+
+    const stats = users.length
+      ? await Order.aggregate([
+          {
+            $match: {
+              ...PURCHASE_MATCH,
+              user: {
+                $in: users.map((u) => u._id),
+              },
+            },
+          },
+          {
+            $group: {
+              _id: "$user",
+              orderCount: { $sum: 1 },
+              totalSpent: { $sum: "$total" },
+              lastOrderAt: { $max: "$createdAt" },
+            },
+          },
+        ])
+      : [];
+
+    // Each user's default address (else their most recent
+    // one), so the admin list and its Excel export can show
+    // where a customer is without opening every profile.
+    const addresses = users.length
+      ? await Address.find({
+          user: {
+            $in: users.map((u) => u._id),
+          },
+        })
+          .sort({ isDefault: -1, updatedAt: -1 })
+          .lean()
+      : [];
+
+    const addressByUser = new Map();
+    for (const address of addresses) {
+      const key = address.user.toString();
+      if (!addressByUser.has(key)) {
+        addressByUser.set(key, address);
+      }
+    }
+
+    const statsByUser = new Map(
+      stats.map((row) => [
+        row._id.toString(),
+        row,
+      ])
+    );
+
+    const usersWithPurchases = users.map(
+      (user) => {
+        const row = statsByUser.get(
+          user._id.toString()
+        );
+        const address = addressByUser.get(
+          user._id.toString()
+        );
+        return {
+          ...user,
+          address: address
+            ? {
+                name: address.name || "",
+                phone: address.phone || "",
+                addressLine1:
+                  address.addressLine1 || "",
+                addressLine2:
+                  address.addressLine2 || "",
+                city: address.city || "",
+                state: address.state || "",
+                postalCode:
+                  address.postalCode || "",
+                country: address.country || "",
+              }
+            : null,
+          purchases: {
+            orderCount: row?.orderCount || 0,
+            totalSpent: row?.totalSpent || 0,
+            lastOrderAt:
+              row?.lastOrderAt || null,
+          },
+        };
+      }
+    );
+
+    // --------------------------------------------------
+    // RESPONSE
+    // --------------------------------------------------
+
+    return res.status(200).json({
+      success: true,
+
+      data: {
+        users: usersWithPurchases,
+
+        pagination: {
+          page: currentPage,
+          limit: perPage,
+          totalUsers,
+          totalPages: Math.ceil(
+            totalUsers / perPage
+          ),
+        },
+
+        filters: {
+          search: search.trim(),
+          role,
+          status,
+          buyers,
+          sort,
+        },
+      },
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+// ======================================================
+// GET ONE USER - ADMIN
+// ======================================================
+
+const getAdminUser = async (
+  req,
+  res,
+  next
+) => {
+  try {
+    const { userId } = req.params;
+
+    if (
+      !mongoose.Types.ObjectId.isValid(userId)
+    ) {
+      return res.status(400).json({
+        success: false,
+        message: "Invalid user ID",
+      });
+    }
+
+    const user =
+      await User.findById(userId)
+        .select("-password")
+        .lean();
+
+    if (!user) {
+      return res.status(404).json({
+        success: false,
+        message: "User not found",
+      });
+    }
+
+    // Order summary, so the admin does not have to
+    // cross-reference the orders screen by hand.
+    const [
+      orderCount,
+      recentOrders,
+      spend,
+    ] = await Promise.all([
+      Order.countDocuments({
+        user: user._id,
+      }),
+
+      Order.find({
+        user: user._id,
+      })
+        .select(
+          "orderNumber total orderStatus paymentStatus createdAt"
+        )
+        .sort({
+          createdAt: -1,
+        })
+        .limit(5)
+        .lean(),
+
+      Order.aggregate([
+        {
+          $match: {
+            user: user._id,
+            orderStatus: {
+              $ne: "cancelled",
+            },
+          },
+        },
+        {
+          $group: {
+            _id: null,
+            total: {
+              $sum: "$total",
+            },
+          },
+        },
+      ]),
+    ]);
+
+    return res.status(200).json({
+      success: true,
+      data: {
+        user,
+
+        stats: {
+          orderCount,
+
+          totalSpent:
+            spend[0]?.total || 0,
+        },
+
+        recentOrders,
+      },
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
+// ======================================================
+// SUSPEND / REACTIVATE USER - ADMIN
+//
+// login already refuses an inactive account, so flipping
+// this flag is what actually blocks someone.
+// ======================================================
+
+const updateUserStatus = async (
+  req,
+  res,
+  next
+) => {
+  try {
+    const { userId } = req.params;
+
+    const { isActive } = req.body;
+
+    if (
+      !mongoose.Types.ObjectId.isValid(userId)
+    ) {
+      return res.status(400).json({
+        success: false,
+        message: "Invalid user ID",
+      });
+    }
+
+    if (
+      typeof isActive !== "boolean"
+    ) {
+      return res.status(400).json({
+        success: false,
+        message:
+          "isActive must be true or false",
+      });
+    }
+
+    const user =
+      await User.findById(userId);
+
+    if (!user) {
+      return res.status(404).json({
+        success: false,
+        message: "User not found",
+      });
+    }
+
+    // Locking yourself out is never intentional.
+    if (
+      user._id.toString() ===
+      req.user.userId
+    ) {
+      return res.status(400).json({
+        success: false,
+        message:
+          "You cannot suspend your own account",
+      });
+    }
+
+    user.isActive = isActive;
+
+    await user.save();
+
+    return res.status(200).json({
+      success: true,
+      message: isActive
+        ? "User reactivated successfully"
+        : "User suspended successfully",
+      data: {
+        user: {
+          id: user._id,
+          name: user.name,
+          email: user.email,
+          role: user.role,
+          isActive:
+            user.isActive,
+        },
+      },
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
+module.exports = {
+  updateUserRole,
+  updateUserStatus,
+  getAdminUsers,
+  getAdminUser,
+};

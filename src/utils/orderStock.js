@@ -1,0 +1,444 @@
+const Product = require("../models/Product");
+const ProductVariant = require("../models/ProductVariant");
+const Setting = require("../models/Setting");
+
+// ======================================================
+// ORDER STATUS RULES
+//
+// Stock leaves inventory in payment/verify. It comes back
+// only here, and only once per order.
+// ======================================================
+
+const ORDER_STATUSES = [
+  "confirmed",
+  "processing",
+  "shipped",
+  "out_for_delivery",
+  "delivered",
+  "cancelled",
+];
+
+// What an order in a given state is allowed to become.
+// Any FORWARD step is allowed - including skipping ahead
+// (e.g. confirmed -> delivered when the admin delivers by
+// hand). Anything not listed is rejected, so an order can
+// never move backwards or leave a terminal state.
+const ALLOWED_TRANSITIONS = {
+  confirmed: [
+    "processing",
+    "shipped",
+    "out_for_delivery",
+    "delivered",
+    "cancelled",
+  ],
+
+  processing: [
+    "shipped",
+    "out_for_delivery",
+    "delivered",
+    "cancelled",
+  ],
+
+  shipped: [
+    "out_for_delivery",
+    "delivered",
+    "cancelled",
+  ],
+
+  out_for_delivery: [
+    "delivered",
+    "cancelled",
+  ],
+
+  // Terminal
+  delivered: [],
+  cancelled: [],
+};
+
+// A customer may only pull the plug before the parcel
+// has left. After that it is a support/returns matter.
+const CUSTOMER_CANCELLABLE = [
+  "confirmed",
+  "processing",
+];
+
+const canTransition = (
+  from,
+  to
+) =>
+  Boolean(
+    ALLOWED_TRANSITIONS[from]?.includes(
+      to
+    )
+  );
+
+// ======================================================
+// RESTORE STOCK
+//
+// Puts every line item back. Idempotent: an order that
+// already has stockRestoredAt set is left alone, so a
+// double cancel cannot inflate inventory.
+// ======================================================
+
+const restoreOrderStock = async (
+  order,
+  session
+) => {
+  if (order.stockRestoredAt) {
+    return false;
+  }
+
+  for (const item of order.items) {
+    if (item.variant) {
+      await ProductVariant.updateOne(
+        {
+          _id: item.variant,
+        },
+        {
+          $inc: {
+            stock: item.quantity,
+          },
+        },
+        {
+          session,
+        }
+      );
+
+      continue;
+    }
+
+    await Product.updateOne(
+      {
+        _id: item.product,
+      },
+      {
+        $inc: {
+          stock: item.quantity,
+        },
+      },
+      {
+        session,
+      }
+    );
+  }
+
+  order.stockRestoredAt =
+    new Date();
+
+  return true;
+};
+
+// ======================================================
+// CANCELLATION REASONS
+//
+// A fixed list rather than free text, so "why do people
+// cancel" is a question the reports can actually answer.
+// The storefront renders these as a dropdown.
+// ======================================================
+
+const CANCEL_REASONS = [
+  {
+    code: "ordered_by_mistake",
+    label:
+      "I ordered this by mistake",
+  },
+  {
+    code: "found_better_price",
+    label:
+      "I found a better price elsewhere",
+  },
+  {
+    code: "changed_mind",
+    label:
+      "I changed my mind",
+  },
+  {
+    code: "wrong_item",
+    label:
+      "I ordered the wrong item",
+  },
+  {
+    code: "duplicate_order",
+    label:
+      "I placed this order twice",
+  },
+  {
+    code: "delivery_too_slow",
+    label:
+      "Delivery is taking too long",
+  },
+  {
+    code: "address_issue",
+    label:
+      "I need to change the delivery address",
+  },
+  {
+    code: "other",
+    label: "Something else",
+  },
+];
+
+const CANCEL_REASON_CODES =
+  CANCEL_REASONS.map(
+    (r) => r.code
+  );
+
+const cancelReasonLabel = (
+  code
+) =>
+  CANCEL_REASONS.find(
+    (r) => r.code === code
+  )?.label || null;
+
+// ======================================================
+// DEDUCT STOCK FOR A CART
+//
+// Builds the order line items and takes the stock in one
+// pass. Each deduction is a conditional update, so two
+// shoppers racing for the last unit cannot both win.
+//
+// Throws on any problem: the caller runs this inside a
+// transaction and aborts.
+// ======================================================
+
+const deductStockForCart = async (
+  cart,
+  session
+) => {
+  const Product = require("../models/Product");
+  const ProductVariant = require("../models/ProductVariant");
+
+  const orderItems = [];
+
+  let subtotal = 0;
+
+  for (const cartItem of cart.items) {
+    const product =
+      await Product.findOne({
+        _id: cartItem.product,
+        isActive: true,
+      }).session(session);
+
+    if (!product) {
+      throw new Error(
+        "A product in your cart is no longer available"
+      );
+    }
+
+    let price = product.price;
+    let variant = null;
+
+    if (product.hasVariants) {
+      if (!cartItem.variant) {
+        throw new Error(
+          `${product.name} requires a variant`
+        );
+      }
+
+      variant =
+        await ProductVariant.findOne({
+          _id: cartItem.variant,
+          product: product._id,
+          isActive: true,
+        }).session(session);
+
+      if (!variant) {
+        throw new Error(
+          `${product.name} variant is no longer available`
+        );
+      }
+
+      const updatedVariant =
+        await ProductVariant.findOneAndUpdate(
+          {
+            _id: variant._id,
+            stock: {
+              $gte:
+                cartItem.quantity,
+            },
+          },
+          {
+            $inc: {
+              stock:
+                -cartItem.quantity,
+            },
+          },
+          {
+            new: true,
+            session,
+          }
+        );
+
+      if (!updatedVariant) {
+        throw new Error(
+          `Insufficient stock for ${product.name}`
+        );
+      }
+
+      price =
+        updatedVariant.price;
+    } else {
+      const updatedProduct =
+        await Product.findOneAndUpdate(
+          {
+            _id: product._id,
+            stock: {
+              $gte:
+                cartItem.quantity,
+            },
+          },
+          {
+            $inc: {
+              stock:
+                -cartItem.quantity,
+            },
+          },
+          {
+            new: true,
+            session,
+          }
+        );
+
+      if (!updatedProduct) {
+        throw new Error(
+          `Insufficient stock for ${product.name}`
+        );
+      }
+
+      price =
+        updatedProduct.price;
+    }
+
+    const itemTotal =
+      price * cartItem.quantity;
+
+    subtotal += itemTotal;
+
+    orderItems.push({
+      product: product._id,
+
+      productName: product.name,
+
+      productImage:
+        product.image?.url || null,
+
+      variant: variant
+        ? variant._id
+        : null,
+
+      variantName: variant
+        ? variant.name
+        : null,
+
+      quantity:
+        cartItem.quantity,
+
+      price,
+
+      itemTotal,
+    });
+  }
+
+  return {
+    orderItems,
+    subtotal,
+  };
+};
+
+// ======================================================
+// TOTALS
+//
+// One place, so checkout and Razorpay can never quote
+// different numbers for the same cart. Shipping charge and
+// free-shipping threshold come from the admin-editable
+// Setting singleton, so pricing changes need no redeploy.
+// ======================================================
+
+const calculateTotals = async (
+  subtotal
+) => {
+  const setting =
+    await Setting.getSingleton();
+
+  const shipping =
+    subtotal >=
+    setting.freeShippingThreshold
+      ? 0
+      : setting.shippingCharge;
+
+  const giftEligible =
+    subtotal >=
+    setting.freeGiftThreshold;
+
+  return {
+    subtotal,
+    shipping,
+    total: subtotal + shipping,
+    freeGiftThreshold:
+      setting.freeGiftThreshold,
+    giftEligible,
+    // Whether a gift will actually be attached needs the product
+    // to exist too - being past the threshold is not enough if
+    // admin has not configured one yet.
+    hasFreeGiftProduct: Boolean(
+      giftEligible &&
+        setting.freeGiftProduct
+    ),
+  };
+};
+
+// ======================================================
+// FREE GIFT SELECTION
+//
+// The gift is one fixed product admin configures in Settings,
+// not something the customer picks - so this just looks it up
+// and confirms it is still real. Re-run wherever an order is
+// created, same as stock and price: never trust a cached value.
+// ======================================================
+
+const resolveGiftSelection = async (
+  giftEligible
+) => {
+  if (!giftEligible) {
+    return null;
+  }
+
+  const setting =
+    await Setting.getSingleton();
+
+  if (!setting.freeGiftProduct) {
+    return null;
+  }
+
+  const giftProduct =
+    await Product.findOne({
+      _id: setting.freeGiftProduct,
+      isActive: true,
+    }).lean();
+
+  if (!giftProduct) {
+    return null;
+  }
+
+  return {
+    giftProduct: giftProduct._id,
+    giftProductName: giftProduct.name,
+    giftProductImage:
+      giftProduct.image?.url || "",
+  };
+};
+
+module.exports = {
+  ORDER_STATUSES,
+  CANCEL_REASONS,
+  CANCEL_REASON_CODES,
+  cancelReasonLabel,
+  ALLOWED_TRANSITIONS,
+  CUSTOMER_CANCELLABLE,
+  canTransition,
+  restoreOrderStock,
+  deductStockForCart,
+  calculateTotals,
+  resolveGiftSelection,
+};
+
