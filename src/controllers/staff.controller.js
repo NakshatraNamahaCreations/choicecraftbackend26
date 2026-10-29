@@ -11,13 +11,18 @@ const {
 //
 // Staff are User documents with role "staff", a free
 // staffTitle and the list of admin-panel modules they may
-// use. Mounted behind protect + superAdminOnly.
+// use. Super admins (role "admin") are managed here too:
+// they pass every check, so they carry no permissions.
+// Mounted behind protect + superAdminOnly.
 // ======================================================
 
 const EMAIL_PATTERN = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 
+const PANEL_ROLES = ["staff", "admin"];
+
 const publicStaff = (user) => ({
   _id: user._id,
+  role: user.role,
   name: user.name,
   email: user.email,
   phone: user.phone || "",
@@ -63,13 +68,25 @@ const revokeSessions = (userId) =>
 
 const findStaff = async (id) => {
   if (!mongoose.Types.ObjectId.isValid(id)) return null;
-  return User.findOne({ _id: id, role: "staff" });
+  return User.findOne({ _id: id, role: { $in: PANEL_ROLES } });
 };
+
+// Removing, demoting or disabling a super admin must leave
+// at least one other active one, or nobody can manage staff.
+const otherActiveAdminExists = (id) =>
+  User.exists({
+    _id: { $ne: id },
+    role: "admin",
+    isActive: { $ne: false },
+  });
+
+const isSelf = (req, user) =>
+  String(req.user?.userId) === String(user._id);
 
 // GET /api/admin/staff
 const listStaff = async (req, res, next) => {
   try {
-    const staff = await User.find({ role: "staff" })
+    const staff = await User.find({ role: { $in: PANEL_ROLES } })
       .sort({ createdAt: -1 })
       .lean();
 
@@ -97,6 +114,7 @@ const createStaff = async (req, res, next) => {
       permissions,
       isActive,
     } = req.body || {};
+    const role = req.body?.role === "admin" ? "admin" : "staff";
 
     if (!name?.trim() || !email?.trim() || !password) {
       return res.status(400).json({
@@ -120,7 +138,8 @@ const createStaff = async (req, res, next) => {
       });
     }
 
-    const [modules, permissionError] = cleanPermissions(permissions);
+    const [modules, permissionError] =
+      role === "admin" ? [[], ""] : cleanPermissions(permissions);
     if (permissionError) {
       return res.status(400).json({
         success: false,
@@ -140,7 +159,7 @@ const createStaff = async (req, res, next) => {
       email: normalizedEmail,
       phone: (phone || "").trim(),
       password: String(password),
-      role: "staff",
+      role,
       staffTitle: (staffTitle || "").trim(),
       permissions: modules,
       isActive: typeof isActive === "boolean" ? isActive : true,
@@ -178,6 +197,30 @@ const updateStaff = async (req, res, next) => {
     } = req.body || {};
     let signOut = false;
 
+    const role = PANEL_ROLES.includes(req.body?.role)
+      ? req.body.role
+      : staff.role;
+    const roleChanged = role !== staff.role;
+    const disabling = staff.isActive && isActive === false;
+
+    if (isSelf(req, staff) && (roleChanged || disabling)) {
+      return res.status(400).json({
+        success: false,
+        message: "You can't change your own role or disable your own account",
+      });
+    }
+
+    if (
+      staff.role === "admin" &&
+      (roleChanged || disabling) &&
+      !(await otherActiveAdminExists(staff._id))
+    ) {
+      return res.status(400).json({
+        success: false,
+        message: "There must always be at least one active Super Admin",
+      });
+    }
+
     if (name !== undefined) {
       if (!String(name).trim()) {
         return res.status(400).json({
@@ -190,7 +233,9 @@ const updateStaff = async (req, res, next) => {
     if (phone !== undefined) staff.phone = String(phone || "").trim();
     if (staffTitle !== undefined) staff.staffTitle = String(staffTitle || "").trim();
 
-    if (permissions !== undefined) {
+    if (role === "admin") {
+      staff.permissions = [];
+    } else if (permissions !== undefined || roleChanged) {
       const [modules, permissionError] = cleanPermissions(permissions);
       if (permissionError) {
         return res.status(400).json({
@@ -199,6 +244,13 @@ const updateStaff = async (req, res, next) => {
         });
       }
       staff.permissions = modules;
+    }
+
+    // The role is inside their access token - sign them out
+    // so their next login carries the new one.
+    if (roleChanged) {
+      staff.role = role;
+      signOut = true;
     }
 
     if (typeof isActive === "boolean") {
@@ -238,6 +290,23 @@ const deleteStaff = async (req, res, next) => {
       return res.status(404).json({
         success: false,
         message: "Staff member not found",
+      });
+    }
+
+    if (isSelf(req, staff)) {
+      return res.status(400).json({
+        success: false,
+        message: "You can't remove your own account",
+      });
+    }
+
+    if (
+      staff.role === "admin" &&
+      !(await otherActiveAdminExists(staff._id))
+    ) {
+      return res.status(400).json({
+        success: false,
+        message: "There must always be at least one active Super Admin",
       });
     }
 
