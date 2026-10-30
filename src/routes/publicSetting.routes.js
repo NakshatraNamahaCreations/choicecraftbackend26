@@ -4,6 +4,7 @@ const {
   getShippingSettings,
   getGiftSettings,
   getDealStrip,
+  getContactSettings,
 } = require("../controllers/setting.controller");
 
 const router = express.Router();
@@ -32,6 +33,11 @@ router.get(
 router.get(
   "/deal-strip",
   getDealStrip
+);
+
+router.get(
+  "/contact",
+  getContactSettings
 );
 
 module.exports = router;

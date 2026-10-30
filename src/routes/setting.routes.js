@@ -7,6 +7,8 @@ const {
   updateGiftSettings,
   getDealStrip,
   updateDealStrip,
+  getContactSettings,
+  updateContactSettings,
 } = require("../controllers/setting.controller");
 
 const {
@@ -60,6 +62,20 @@ router.put(
   protect,
   adminOnly,
   updateDealStrip
+);
+
+router.get(
+  "/contact",
+  protect,
+  adminOnly,
+  getContactSettings
+);
+
+router.put(
+  "/contact",
+  protect,
+  adminOnly,
+  updateContactSettings
 );
 
 module.exports = router;

@@ -89,6 +89,29 @@ const settingSchema = new mongoose.Schema(
         "NEW SEASON NOTE BOOKS IN STOCK",
       ],
     },
+
+    // Contact details the storefront shows on Contact Us, in
+    // the footer and on the floating call/WhatsApp buttons.
+    contactPhone: {
+      type: String,
+      trim: true,
+      default: "+91 74001 81786",
+    },
+
+    contactEmail: {
+      type: String,
+      trim: true,
+      lowercase: true,
+      default: "support@choicekraft.com",
+    },
+
+    // Digits only, country code first - the form wa.me links
+    // need (917400181786, not +91 74001 81786).
+    contactWhatsapp: {
+      type: String,
+      trim: true,
+      default: "917400181786",
+    },
   },
   {
     timestamps: true,

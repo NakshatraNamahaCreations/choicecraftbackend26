@@ -389,6 +389,129 @@ const updateDealStrip = async (
   }
 };
 
+// ======================================================
+// CONTACT DETAILS (Contact Us page, footer, call and
+// WhatsApp buttons)
+// ======================================================
+
+const EMAIL_PATTERN = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+
+const contactResponseData = (setting) => ({
+  phone: setting.contactPhone,
+  email: setting.contactEmail,
+  whatsapp: setting.contactWhatsapp,
+});
+
+const getContactSettings = async (
+  req,
+  res,
+  next
+) => {
+  try {
+    const setting =
+      await Setting.getSingleton();
+
+    return res.status(200).json({
+      success: true,
+      data: contactResponseData(setting),
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
+const updateContactSettings = async (
+  req,
+  res,
+  next
+) => {
+  try {
+    const { phone, email, whatsapp } =
+      req.body || {};
+    const values = {};
+
+    if (phone !== undefined) {
+      const cleaned = String(phone)
+        .replace(/\s+/g, " ")
+        .trim();
+      const digits = cleaned.replace(/\D/g, "");
+
+      if (
+        !/^[+\d\s()-]+$/.test(cleaned) ||
+        digits.length < 7 ||
+        digits.length > 15
+      ) {
+        return res.status(400).json({
+          success: false,
+          message:
+            "Enter a valid phone number, e.g. +91 74001 81786",
+        });
+      }
+      values.contactPhone = cleaned;
+    }
+
+    if (email !== undefined) {
+      const cleaned = String(email)
+        .trim()
+        .toLowerCase();
+
+      if (
+        !EMAIL_PATTERN.test(cleaned) ||
+        cleaned.length > 254
+      ) {
+        return res.status(400).json({
+          success: false,
+          message: "Enter a valid email address",
+        });
+      }
+      values.contactEmail = cleaned;
+    }
+
+    if (whatsapp !== undefined) {
+      let digits = String(whatsapp).replace(
+        /\D/g,
+        ""
+      );
+
+      // A bare 10-digit Indian mobile - add the country code
+      // wa.me needs rather than reject it.
+      if (digits.length === 10) {
+        digits = "91" + digits;
+      }
+
+      if (digits.length < 11 || digits.length > 15) {
+        return res.status(400).json({
+          success: false,
+          message:
+            "Enter the WhatsApp number with country code, e.g. 91 74001 81786",
+        });
+      }
+      values.contactWhatsapp = digits;
+    }
+
+    if (!Object.keys(values).length) {
+      return res.status(400).json({
+        success: false,
+        message:
+          "Send at least one of phone, email or whatsapp",
+      });
+    }
+
+    const setting =
+      await Setting.getSingleton();
+    Object.assign(setting, values);
+    await setting.save();
+
+    return res.status(200).json({
+      success: true,
+      message: "Contact details updated",
+      data: contactResponseData(setting),
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
 module.exports = {
   getShippingSettings,
   updateShippingSettings,
@@ -396,4 +519,6 @@ module.exports = {
   updateGiftSettings,
   getDealStrip,
   updateDealStrip,
+  getContactSettings,
+  updateContactSettings,
 };
