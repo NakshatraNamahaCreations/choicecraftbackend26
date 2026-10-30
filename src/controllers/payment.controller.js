@@ -1051,14 +1051,194 @@ const generateOrderNumber = () => {
 };
 
 // ======================================================
-// REFUND A PAYMENT - ADMIN
+// REFUNDS - ADMIN
 //
-// Refunds through Razorpay, then marks the payment and
-// its order as refunded. Cancelling the order (and
-// returning stock) is a separate, deliberate step:
-// PATCH /api/admin/orders/:id/status
+// Money goes back through Razorpay to the card/UPI/bank
+// the customer paid with. Full refund by default; a smaller
+// amount is a partial refund, and several partials can add
+// up to the full amount. The payment only becomes
+// "refunded" once nothing is left to refund.
+//
+// Cancelling the order (and returning stock) is a separate,
+// deliberate step: PATCH /api/admin/orders/:id/status.
 // ======================================================
 
+const REFUND_REASON_MAX = 300;
+
+// Rupees to 2 decimals, so 0.1 + 0.2 style float drift
+// never blocks the last paisa of a refund.
+const toRupees = (value) =>
+  Math.round(Number(value) * 100) / 100;
+
+const refundableAmount = (payment) =>
+  toRupees(
+    payment.amount -
+      (payment.amountRefunded || 0)
+  );
+
+// Returns { status, body } - the caller sends it.
+const processRefund = async ({
+  payment,
+  amount,
+  reason,
+  adminId,
+}) => {
+  if (payment.status === "refunded") {
+    return {
+      status: 409,
+      body: {
+        success: false,
+        message:
+          "This payment has already been fully refunded",
+      },
+    };
+  }
+
+  if (payment.status !== "captured") {
+    return {
+      status: 409,
+      body: {
+        success: false,
+        message:
+          `Only a captured payment can be refunded. This one is ${payment.status}.`,
+      },
+    };
+  }
+
+  if (!payment.razorpayPaymentId) {
+    return {
+      status: 409,
+      body: {
+        success: false,
+        message:
+          "This payment has no Razorpay payment id to refund against",
+      },
+    };
+  }
+
+  const remaining =
+    refundableAmount(payment);
+
+  if (remaining <= 0) {
+    return {
+      status: 409,
+      body: {
+        success: false,
+        message:
+          "Nothing left to refund on this payment",
+      },
+    };
+  }
+
+  const refundAmount =
+    amount === undefined ||
+    amount === null ||
+    amount === ""
+      ? remaining
+      : toRupees(amount);
+
+  if (
+    !Number.isFinite(refundAmount) ||
+    refundAmount < 1 ||
+    refundAmount > remaining
+  ) {
+    return {
+      status: 400,
+      body: {
+        success: false,
+        message:
+          `Refund amount must be between ₹1 and ₹${remaining}`,
+      },
+    };
+  }
+
+  const note = String(
+    reason || "Refunded by admin"
+  )
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, REFUND_REASON_MAX);
+
+  const refund =
+    await razorpay.payments.refund(
+      payment.razorpayPaymentId,
+      {
+        // Razorpay works in paise
+        amount: Math.round(
+          refundAmount * 100
+        ),
+        notes: { reason: note },
+      }
+    );
+
+  // $inc/$push rather than save(), so two refunds landing
+  // together both count.
+  const updated =
+    await Payment.findByIdAndUpdate(
+      payment._id,
+      {
+        $inc: {
+          amountRefunded: refundAmount,
+        },
+        $push: {
+          refunds: {
+            razorpayRefundId: refund.id,
+            amount: refundAmount,
+            status:
+              refund.status || "pending",
+            reason: note,
+            refundedBy: adminId || null,
+          },
+        },
+      },
+      { new: true }
+    );
+
+  const fullyRefunded =
+    refundableAmount(updated) <= 0;
+
+  if (fullyRefunded) {
+    updated.status = "refunded";
+    await updated.save();
+
+    await Order.updateOne(
+      { payment: updated._id },
+      {
+        $set: {
+          paymentStatus: "refunded",
+        },
+      }
+    );
+  }
+
+  return {
+    status: 200,
+    body: {
+      success: true,
+      message: fullyRefunded
+        ? "Payment refunded in full"
+        : `Refunded ₹${refundAmount} of ₹${updated.amount}`,
+      data: {
+        refund: {
+          id: refund.id,
+          amount: refund.amount / 100,
+          status: refund.status,
+        },
+
+        payment: {
+          id: updated._id,
+          status: updated.status,
+          amount: updated.amount,
+          amountRefunded:
+            toRupees(updated.amountRefunded),
+          refunds: updated.refunds,
+        },
+      },
+    },
+  };
+};
+
+// POST /api/admin/payments/:id/refund
 const refundPayment = async (
   req,
   res,
@@ -1066,9 +1246,6 @@ const refundPayment = async (
 ) => {
   try {
     const { id } = req.params;
-
-    const { amount, reason } =
-      req.body || {};
 
     if (
       !mongoose.Types.ObjectId.isValid(id)
@@ -1091,108 +1268,82 @@ const refundPayment = async (
       });
     }
 
-    if (
-      payment.status ===
-      "refunded"
-    ) {
-      return res.status(409).json({
-        success: false,
-        message:
-          "This payment has already been refunded",
+    const { status, body } =
+      await processRefund({
+        payment,
+        amount: req.body?.amount,
+        reason: req.body?.reason,
+        adminId: req.user?.userId,
       });
-    }
+
+    return res.status(status).json(body);
+  } catch (error) {
+    next(
+      normalizeRazorpayError(error)
+    );
+  }
+};
+
+// POST /api/admin/orders/:id/refund
+//
+// The admin panel's "Refund" button on a cancelled order.
+// Only cancelled orders: refunding an order that is still
+// going out would ship goods for free.
+const refundOrder = async (
+  req,
+  res,
+  next
+) => {
+  try {
+    const { id } = req.params;
 
     if (
-      payment.status !==
-      "captured"
-    ) {
-      return res.status(409).json({
-        success: false,
-        message:
-          `Only a captured payment can be refunded. This one is ${payment.status}.`,
-      });
-    }
-
-    if (
-      !payment.razorpayPaymentId
-    ) {
-      return res.status(409).json({
-        success: false,
-        message:
-          "This payment has no Razorpay payment id to refund against",
-      });
-    }
-
-    // Partial refunds are allowed, full is the default.
-    const refundAmount =
-      amount === undefined
-        ? payment.amount
-        : Number(amount);
-
-    if (
-      Number.isNaN(refundAmount) ||
-      refundAmount <= 0 ||
-      refundAmount >
-        payment.amount
+      !mongoose.Types.ObjectId.isValid(id)
     ) {
       return res.status(400).json({
         success: false,
-        message:
-          `amount must be a number between 1 and ${payment.amount}`,
+        message: "Invalid order ID",
       });
     }
 
-    const refund =
-      await razorpay.payments.refund(
-        payment.razorpayPaymentId,
-        {
-          // Razorpay works in paise
-          amount:
-            refundAmount * 100,
+    const order = await Order.findById(id);
 
-          notes: {
-            reason:
-              reason ||
-              "Refunded by admin",
-          },
-        }
-      );
+    if (!order) {
+      return res.status(404).json({
+        success: false,
+        message: "Order not found",
+      });
+    }
 
-    payment.status = "refunded";
+    if (order.orderStatus !== "cancelled") {
+      return res.status(409).json({
+        success: false,
+        message:
+          "Cancel the order first - only cancelled orders can be refunded",
+      });
+    }
 
-    await payment.save();
+    const payment = order.payment
+      ? await Payment.findById(order.payment)
+      : null;
 
-    await Order.updateOne(
-      {
-        payment: payment._id,
-      },
-      {
-        $set: {
-          paymentStatus:
-            "refunded",
-        },
-      }
-    );
+    if (!payment) {
+      return res.status(409).json({
+        success: false,
+        message:
+          "This order has no payment record to refund",
+      });
+    }
 
-    return res.status(200).json({
-      success: true,
-      message:
-        "Payment refunded successfully",
-      data: {
-        refund: {
-          id: refund.id,
-          amount:
-            refund.amount / 100,
-          status: refund.status,
-        },
+    const { status, body } =
+      await processRefund({
+        payment,
+        amount: req.body?.amount,
+        reason: req.body?.reason,
+        adminId: req.user?.userId,
+      });
 
-        payment: {
-          id: payment._id,
-          status:
-            payment.status,
-        },
-      },
-    });
+    return res.status(status).json(body);
   } catch (error) {
     next(
       normalizeRazorpayError(error)
@@ -1374,4 +1525,5 @@ module.exports = {
   getAdminPayments,
   getAdminPaymentById,
   refundPayment,
+  refundOrder,
 };

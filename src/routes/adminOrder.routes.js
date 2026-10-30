@@ -8,6 +8,10 @@ const {
 } = require("../controllers/order.controller");
 
 const {
+  refundOrder,
+} = require("../controllers/payment.controller");
+
+const {
   protect,
   adminOnly,
 } = require("../middleware/auth.middleware");
@@ -43,6 +47,13 @@ router.patch(
 router.post(
   "/:id/retry-shiprocket",
   retryShiprocket
+);
+
+// Refund a cancelled order's payment through Razorpay
+// (full by default, or { amount } for a partial refund)
+router.post(
+  "/:id/refund",
+  refundOrder
 );
 
 module.exports = router;

@@ -57,6 +57,51 @@ const paymentSchema = new mongoose.Schema(
       default: null,
     },
 
+    // Running total refunded through Razorpay. Status only
+    // becomes "refunded" once this reaches `amount`; a
+    // partial refund leaves the payment "captured".
+    amountRefunded: {
+      type: Number,
+      default: 0,
+      min: 0,
+    },
+
+    // One entry per refund an admin issued.
+    refunds: [
+      {
+        razorpayRefundId: {
+          type: String,
+          required: true,
+        },
+        amount: {
+          type: Number,
+          required: true,
+          min: 0,
+        },
+        // Razorpay's own status: "pending" until the bank
+        // confirms, then "processed".
+        status: {
+          type: String,
+          default: "pending",
+        },
+        reason: {
+          type: String,
+          default: "",
+          trim: true,
+          maxlength: 300,
+        },
+        refundedBy: {
+          type: mongoose.Schema.Types.ObjectId,
+          ref: "User",
+          default: null,
+        },
+        createdAt: {
+          type: Date,
+          default: Date.now,
+        },
+      },
+    ],
+
     verifiedAt: {
       type: Date,
       default: null,
